@@ -2,6 +2,10 @@
 
 ## 1.0.0 — Unreleased
 
+- Defined verifier failure retry semantics (`hpx-vr/1`) for the registry
+  external-verifier path: stable failure classes, bounded in-tx dependency
+  retries, append-only errors `VerifierDependencyFailure` / `VerifierRetryExhausted`,
+  privacy-safe read helpers, and docs in `contracts/VERIFIER_RETRY.md` (#326).
 - Added a CI end-to-end environment matrix (`devx/e2e_env_matrix.py`) that exercises public API boundaries across development/testing/production-like profiles with privacy-safe failure checks.
 
 - Added an atomic compatibility manifest and release gate spanning frontend,

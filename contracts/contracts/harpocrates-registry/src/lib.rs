@@ -9,8 +9,13 @@ use soroban_sdk::{
 };
 
 pub mod verifier_inputs;
+pub mod verifier_retry;
 
 use verifier_inputs::{RejectCode, PUBLIC_INPUTS_LEN};
+use verifier_retry::{
+    classify_invoke_flags, classify_registry_error, should_retry_in_tx, VerifierInvokeOutcome,
+    MAX_VERIFIER_INVOKE_ATTEMPTS, RETRY_SEMANTICS_ID,
+};
 
 /// Schema selectors accepted by [`HarpocratesRegistry::classify_public_inputs`].
 pub const SCHEMA_ID_SILENT_WITNESS: u32 = 1;
@@ -987,6 +992,11 @@ pub enum RegistryError {
     ReporterOnCooldown = 66,
     /// The dispute is not in the state this transition requires.
     InvalidDisputeTransition = 67,
+    /// External verifier dependency failed in a way that is safe to retry
+    /// after operator remediation (#326).
+    VerifierDependencyFailure = 68,
+    /// In-transaction verifier invoke retries were exhausted (#326).
+    VerifierRetryExhausted = 69,
 }
 
 #[contract]
@@ -1236,6 +1246,36 @@ impl HarpocratesRegistry {
 
     pub fn get_verifier_state(env: Env) -> VerifierState {
         get_verifier_rotation_state(&env)
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Verifier failure retry semantics (#326)
+    // -----------------------------------------------------------------------
+
+    /// Return the active verifier retry policy (`hpx-vr/1`).
+    ///
+    /// First value is a privacy-safe 32-bit prefix of the semantics id so
+    /// clients can assert table agreement without embedding long strings in
+    /// every transaction. Second value is `MAX_VERIFIER_INVOKE_ATTEMPTS`.
+    pub fn get_verifier_retry_policy(_env: Env) -> (u32, u32) {
+        // Stable prefix of RETRY_SEMANTICS_ID ("hpx-vr/1") as big-endian u32
+        // of the first four ASCII bytes: b"hpx-".
+        let id_prefix = 0x6870782Du32; // 'h' 'p' 'x' '-'
+        let _ = RETRY_SEMANTICS_ID; // keep the string authority referenced
+        (id_prefix, MAX_VERIFIER_INVOKE_ATTEMPTS)
+    }
+
+    /// Return whether a `RegistryError` discriminant is client-retryable under
+    /// `hpx-vr/1`. Unknown codes fail closed (`false`).
+    pub fn is_registry_error_retryable(_env: Env, code: u32) -> bool {
+        classify_registry_error(code).client_retryable()
+    }
+
+    /// Return the `VerifierFailureClass` discriminant for a `RegistryError`
+    /// code. Unknown codes map to `permanent_reject` (fail closed).
+    pub fn classify_registry_error_class(_env: Env, code: u32) -> u32 {
+        classify_registry_error(code).as_u32()
     }
 
     pub fn add_credential_root(
@@ -3572,14 +3612,71 @@ fn get_scope_epoch_raw(env: &Env, scope: &BytesN<32>) -> u64 {
         .unwrap_or(DEFAULT_SCOPE_EPOCH)
 }
 
+/// Invoke the configured external verifier with `hpx-vr/1` retry semantics.
+///
+/// Permanent rejects panic with `InvalidProof`. Dependency failures retry
+/// in-transaction up to `MAX_VERIFIER_INVOKE_ATTEMPTS`, then panic with
+/// `VerifierRetryExhausted`. Proof bytes are never logged or emitted.
+///
+/// Soroban SDK 27 returns
+/// `Result<Result<T, T::Error>, Result<E, InvokeError>>` from
+/// `try_invoke_contract`; both layers are classified here.
 fn verify_external_proof(env: &Env, verifier: &Address, public_inputs: Bytes, proof: Bytes) {
-    let mut args: SorobanVec<Val> = SorobanVec::new(env);
-    args.push_back(public_inputs.into_val(env));
-    args.push_back(proof.into_val(env));
+    let mut attempt: u32 = 0;
+    loop {
+        attempt = attempt.saturating_add(1);
 
-    match env.try_invoke_contract::<(), InvokeError>(verifier, &Symbol::new(env, "verify_proof"), args) {
-        Ok(Ok(_)) => true,
-        _ => false,
+        let mut args: SorobanVec<Val> = SorobanVec::new(env);
+        args.push_back(public_inputs.clone().into_val(env));
+        args.push_back(proof.clone().into_val(env));
+
+        let result = env.try_invoke_contract::<(), InvokeError>(
+            verifier,
+            &Symbol::new(env, "verify_proof"),
+            args,
+        );
+
+        let outcome = match result {
+            Ok(Ok(_)) => {
+                let _ = classify_invoke_flags(true, true);
+                VerifierInvokeOutcome::Accepted
+            }
+            Ok(Err(_)) => {
+                let _ = classify_invoke_flags(true, false);
+                VerifierInvokeOutcome::PermanentReject
+            }
+            // Host / contract error surface: Abort and non-zero contract codes
+            // are permanent cryptographic rejects for this proof material.
+            // `Contract(0)` is reserved as an operator-remediable dependency
+            // failure so the in-tx retry budget has a concrete trigger.
+            Err(Ok(InvokeError::Contract(0))) | Err(Err(InvokeError::Contract(0))) => {
+                let _ = classify_invoke_flags(false, false);
+                VerifierInvokeOutcome::DependencyFailure
+            }
+            Err(Ok(InvokeError::Abort))
+            | Err(Err(InvokeError::Abort))
+            | Err(Ok(InvokeError::Contract(_)))
+            | Err(Err(InvokeError::Contract(_))) => {
+                let _ = classify_invoke_flags(false, false);
+                VerifierInvokeOutcome::PermanentReject
+            }
+        };
+
+        match outcome {
+            VerifierInvokeOutcome::Accepted => return,
+            VerifierInvokeOutcome::PermanentReject => {
+                panic_with_error!(env, RegistryError::InvalidProof);
+            }
+            VerifierInvokeOutcome::DependencyFailure => {
+                if should_retry_in_tx(outcome, attempt) {
+                    continue;
+                }
+                if attempt >= MAX_VERIFIER_INVOKE_ATTEMPTS {
+                    panic_with_error!(env, RegistryError::VerifierRetryExhausted);
+                }
+                panic_with_error!(env, RegistryError::VerifierDependencyFailure);
+            }
+        }
     }
 }
 
@@ -3998,3 +4095,5 @@ mod test_schema;
 mod test_selective_disclosure;
 #[cfg(test)]
 mod test_upgrade_compat;
+#[cfg(test)]
+mod test_verifier_retry;
