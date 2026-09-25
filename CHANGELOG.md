@@ -6,6 +6,8 @@
   external-verifier path: stable failure classes, bounded in-tx dependency
   retries, append-only errors `VerifierDependencyFailure` / `VerifierRetryExhausted`,
   privacy-safe read helpers, and docs in `contracts/VERIFIER_RETRY.md` (#326).
+- Added on-chain **metadata envelope versioning** for the Soroban registry (`MetadataEnvelope`, `bind_metadata_envelope`, auto-V1 stamp on register, V1→V2 upgrade path) aligned with `backend/envelope.py`. See `contracts/METADATA_ENVELOPE.md`. Closes #317.
+
 - Extended structured fuzzing of proof and public-input decoding: proof-hex
   mutators (odd nibble, non-hex, empty, length edges), exact proof-bound tables,
   silence checks, and regression corpus entries `fz-011`–`fz-013` (#369).
